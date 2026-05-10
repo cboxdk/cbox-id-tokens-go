@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,8 +52,15 @@ func newClient(t *testing.T, endpoint string, opts ...cboxidtokens.Option) *cbox
 	base := []cboxidtokens.Option{
 		cboxidtokens.WithTokenEndpoint(endpoint),
 		cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
+		// httptest binds 127.0.0.1 with http://; opt in here so the
+		// scheme guard accepts it. Production callers must use https.
+		cboxidtokens.WithAllowInsecure(),
 	}
-	return cboxidtokens.New(append(base, opts...)...)
+	c, err := cboxidtokens.New(append(base, opts...)...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
 }
 
 func TestFluentAPIFetchesToken(t *testing.T) {
@@ -299,10 +307,13 @@ func TestCacheKeyMatchesPHPVersion(t *testing.T) {
 	// sharing a Redis hit the same key for the same input.
 	// Material: "test-client|notifications.cbox.systems|notifications.publish"
 	// PHP: hash('sha256', $material) hex.
-	c := cboxidtokens.New(
+	c, err := cboxidtokens.New(
 		cboxidtokens.WithTokenEndpoint("https://id.test/oauth/token"),
 		cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
 	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	got := cboxidtokens.ComputeCacheKey(c, "notifications.cbox.systems", []string{"notifications.publish"})
 
 	// Verified against PHP: hash('sha256', "test-client|notifications.cbox.systems|notifications.publish")
@@ -312,10 +323,70 @@ func TestCacheKeyMatchesPHPVersion(t *testing.T) {
 	}
 }
 
+func TestNewRejectsHTTPEndpointWithoutAllowInsecure(t *testing.T) {
+	_, err := cboxidtokens.New(
+		cboxidtokens.WithTokenEndpoint("http://id.public.example/oauth/token"),
+		cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
+	)
+	if err == nil {
+		t.Fatal("New: expected error for http:// endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "https://") {
+		t.Errorf("New error = %v, want mention of https://", err)
+	}
+}
+
+func TestNewAllowsHTTPLoopbackWithAllowInsecure(t *testing.T) {
+	for _, host := range []string{"http://localhost:8080/oauth/token", "http://127.0.0.1/oauth/token", "http://[::1]/oauth/token"} {
+		t.Run(host, func(t *testing.T) {
+			c, err := cboxidtokens.New(
+				cboxidtokens.WithTokenEndpoint(host),
+				cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
+				cboxidtokens.WithAllowInsecure(),
+			)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if c == nil {
+				t.Fatal("New: client is nil")
+			}
+		})
+	}
+}
+
+func TestNewAllowInsecureDoesNotPermitPublicHTTP(t *testing.T) {
+	_, err := cboxidtokens.New(
+		cboxidtokens.WithTokenEndpoint("http://id.public.example/oauth/token"),
+		cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
+		cboxidtokens.WithAllowInsecure(),
+	)
+	if err == nil {
+		t.Fatal("expected error for http://public-host even with WithAllowInsecure")
+	}
+}
+
+func TestNewRejectsMissingTokenEndpoint(t *testing.T) {
+	_, err := cboxidtokens.New(
+		cboxidtokens.WithClientCredentials(testClientID, testClientSecret),
+	)
+	if err == nil {
+		t.Fatal("expected error when WithTokenEndpoint is omitted")
+	}
+}
+
+func TestNewRejectsMissingClientCredentials(t *testing.T) {
+	_, err := cboxidtokens.New(
+		cboxidtokens.WithTokenEndpoint("https://id.test/oauth/token"),
+	)
+	if err == nil {
+		t.Fatal("expected error when WithClientCredentials is omitted")
+	}
+}
+
 // mutableClock is the test clock used to drive deterministic TTL.
 type mutableClock struct {
 	t time.Time
 }
 
-func (c *mutableClock) Now() time.Time { return c.t }
+func (c *mutableClock) Now() time.Time  { return c.t }
 func (c *mutableClock) Set(t time.Time) { c.t = t }
