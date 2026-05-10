@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -24,19 +26,32 @@ const (
 	// cacheKeyPrefix matches the PHP package byte-for-byte so PHP
 	// and Go consumers sharing a Redis hit the same slot.
 	cacheKeyPrefix = "cbox:svc-token:"
+
+	// defaultDialTimeout is the connect-only budget. Token endpoints
+	// in our infra resolve sub-100ms and connect sub-50ms; 5s leaves
+	// generous slack for the bad-day case without blocking the
+	// outbound call indefinitely on a network partition.
+	defaultDialTimeout = 5 * time.Second
+
+	// defaultTotalTimeout is the connect+read budget on the http.Client
+	// itself, matching the PHP package's `connectTimeout(5)->timeout(10)`
+	// combination so cross-language callers see uniform behaviour.
+	defaultTotalTimeout = 10 * time.Second
 )
 
 // Client is the entry point for fetching and invalidating service
 // tokens. Construct one per service via New + functional options;
 // it's safe to share across goroutines.
 type Client struct {
-	tokenEndpoint string
-	clientID      string
-	clientSecret  string
-	httpClient    *http.Client
-	cache         Cache
-	now           func() time.Time
-	sf            singleflight.Group
+	tokenEndpoint  string
+	clientID       string
+	clientSecret   string
+	httpClient     *http.Client
+	cache          Cache
+	now            func() time.Time
+	sf             singleflight.Group
+	allowInsecure  bool
+	httpClientUser bool // true when the caller supplied a custom *http.Client
 }
 
 // Option configures a Client at construction time. Options that
@@ -44,18 +59,94 @@ type Client struct {
 type Option func(*Client)
 
 // New returns a configured Client. Required options:
-// WithTokenEndpoint, WithClientCredentials. Defaults: 10s HTTP
-// timeout, in-memory cache, time.Now as clock.
-func New(opts ...Option) *Client {
+// WithTokenEndpoint, WithClientCredentials.
+//
+// Defaults:
+//   - HTTP transport with 5s dial timeout + 10s total timeout
+//   - in-memory cache (NewInMemoryCache)
+//   - time.Now as clock
+//
+// SECURITY: tokenEndpoint MUST be https://. http:// is rejected
+// unless WithAllowInsecure was passed AND the host is loopback
+// (localhost / 127.0.0.1 / ::1). Mirrors cbox-id-tokens (PHP).
+//
+// Returns an error when validation fails so the misconfig surfaces
+// at boot rather than on the first outbound call.
+func New(opts ...Option) (*Client, error) {
 	c := &Client{
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		cache:      NewInMemoryCache(),
-		now:        time.Now,
+		cache: NewInMemoryCache(),
+		now:   time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
-	return c
+
+	if c.tokenEndpoint == "" {
+		return nil, errors.New("cbox-id-tokens-go: WithTokenEndpoint is required")
+	}
+	if c.clientID == "" || c.clientSecret == "" {
+		return nil, errors.New("cbox-id-tokens-go: WithClientCredentials is required")
+	}
+	if err := assertSecureScheme(c.tokenEndpoint, c.allowInsecure); err != nil {
+		return nil, err
+	}
+
+	if c.httpClient == nil {
+		c.httpClient = newDefaultHTTPClient()
+	}
+
+	return c, nil
+}
+
+// assertSecureScheme rejects http:// tokenEndpoints unless the
+// caller explicitly opted in via WithAllowInsecure AND the host is
+// loopback. Mirrors the PHP package's check verbatim.
+func assertSecureScheme(rawURL string, allowInsecure bool) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("cbox-id-tokens-go: tokenEndpoint is not a valid URL: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme == "https" {
+		return nil
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	loopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if allowInsecure && scheme == "http" && loopback {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"cbox-id-tokens-go: tokenEndpoint must use https:// (got: %s); "+
+			"for local dev pass WithAllowInsecure() with http://localhost — "+
+			"never with a public hostname",
+		rawURL,
+	)
+}
+
+// newDefaultHTTPClient builds the standard transport: 5s dial,
+// 10s total. The split separates "couldn't connect" (retry-friendly)
+// from "server is slow" (probably needs investigation), and matches
+// the PHP package's connectTimeout(5)->timeout(10) so cross-language
+// callers behave the same on the network.
+func newDefaultHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   defaultDialTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   defaultTotalTimeout,
+	}
 }
 
 // WithTokenEndpoint sets the absolute URL of id's /oauth/token.
@@ -72,11 +163,24 @@ func WithClientCredentials(id, secret string) Option {
 	}
 }
 
-// WithHTTPClient swaps the default HTTP client (10s timeout) for a
-// caller-supplied one. Use to inject custom transports, OTel
-// instrumentation, retries, or shorter / longer timeouts.
+// WithHTTPClient swaps the default HTTP client (5s dial / 10s total)
+// for a caller-supplied one. Use to inject custom transports, OTel
+// instrumentation, retries, or shorter / longer timeouts. Passing
+// an *http.Client with Timeout==0 means no overall budget; you
+// almost certainly want a non-zero timeout in production.
 func WithHTTPClient(h *http.Client) Option {
-	return func(c *Client) { c.httpClient = h }
+	return func(c *Client) {
+		c.httpClient = h
+		c.httpClientUser = true
+	}
+}
+
+// WithAllowInsecure permits an http://localhost (or 127.0.0.1 / ::1)
+// tokenEndpoint. Required for local-dev fixtures and httptest. Does
+// NOT bypass the scheme check for public hosts — those still require
+// https://. Without this option an http:// endpoint fails New().
+func WithAllowInsecure() Option {
+	return func(c *Client) { c.allowInsecure = true }
 }
 
 // WithCache swaps the default in-memory cache for any Cache impl
